@@ -1,3 +1,4 @@
+import types
 from typing import List, Optional, Tuple, Any, Union, Dict
 
 import torch
@@ -16,6 +17,7 @@ class ComputationGraphNode:
 
         self.parent = None
         self.ancestors = []
+        self.alignments = []
 
     def set_ancestors(self, ancestors: List["ComputationGraphNode"]):
         if len(ancestors) > 0:
@@ -29,7 +31,7 @@ class ComputationGraphNode:
         if self._variant == 'module':
             return vz.Token(self._payload.__class__.__name__)
         if self._variant == 'fn':
-            return vz.Token(self._payload.__name__)
+            return vz.Token(self._payload.fn.__name__)
         else:
             return vz.Token(self._payload.__class__.__name__)
 
@@ -52,16 +54,6 @@ class ComputationGraph:
         return node
 
     def edge(self, start: ComputationGraphNode, start_port: str, end: ComputationGraphNode, end_port: str):
-        # if there's already an edge from start to a descendant of end, link that edge to end instead of start
-        for edge in self._edges:
-            if edge[0] == start and edge[1] == start_port and edge[2].has_ancestor(end):
-                edge[0] = end
-                edge[1] = end_port
-                # if the edge would now be routed from child to parent to another child, move the child out to a higher
-                # level until that's not true
-                while start.has_ancestor(end):
-                    start.ancestors.pop()
-                    start.parent = start.ancestors[-1] if len(start.ancestors) > 0 else None
         self._edges.append([start, start_port, end, end_port])
 
     def __view__(self):
@@ -74,9 +66,11 @@ class ComputationGraph:
         for n in self._nodes:
             if n.parent:
                 d.node(node_to_id[n], parent=node_to_id[n.parent])
+            for other in n.alignments:
+                d.node(node_to_id[n], align_with={'axis': 'x', 'justify': 'north', 'nodes': [node_to_id[other]]})
         for edge in self._edges:
-            d.port(node_to_id[edge[0]], edge[1], side='south' if edge[1].startswith('o') else 'north')
-            d.port(node_to_id[edge[2]], edge[3], side='south' if edge[3].startswith('o') else 'north')
+            d.port(node_to_id[edge[0]], edge[1], side='south' if edge[1].startswith('o') else 'north', order=int(edge[1][1:]))
+            d.port(node_to_id[edge[2]], edge[3], side='south' if edge[3].startswith('o') else 'north', order=int(edge[3][1:]))
             d.edge({
                 'id': node_to_id[edge[0]],
                 'port': edge[1],
@@ -85,9 +79,11 @@ class ComputationGraph:
                 'port': edge[3],
             })
         return d
-        # for start, start_port, end, end_port in self._edges:
-        #     print(start._payload.__class__.__name__, start_port, '->')
-        #     print(end._payload.__class__.__name__, end_port)
+
+
+class FunctionContext:
+    def __init__(self, fn):
+        self.fn = fn
 
 
 class Tracker:
@@ -119,27 +115,44 @@ class Tracker:
     def model(self, model: nn.Module):
         self._models.append(model)
 
-    def _forward_pre_hook(self, m: nn.Module, inputs: Tuple[Any, ...]):
-        self._graph.push(ComputationGraphNode(m, 'module'))
-
-    def _forward_hook(self, m: Optional[nn.Module], inputs: Tuple[Any], outputs: Any):
-        node = self._graph.pop()
+    def _forward_pre_hook(self, m: Union[nn.Module, FunctionContext], inputs: Tuple[Any, ...]):
+        node = ComputationGraphNode(m, 'module' if isinstance(m, nn.Module) else 'fn')
         # for each input, create a data node if it has no creator, then create an edge to the correct port
+        setattr(m, '_cg_input_locations', [])
         for i, x in enumerate(inputs):
-            x_nodes = []
             if not isinstance(x, (list, tuple)):
                 x = [x]
+            locations = []
             for _x in x:
                 try:
-                    if not hasattr(_x, '_cg_creator'):
-                        setattr(_x, '_cg_creator', None)
-                        setattr(_x, '_cg_creator', self._graph.push(ComputationGraphNode(_x)).pop())
-                        setattr(_x, '_cg_creator_port', "o0")
-                    x_nodes.append(getattr(_x, '_cg_creator'))
-                    self._graph.edge(x_nodes[-1], getattr(_x, '_cg_creator_port'), node, f"i{i}")
+                    if not hasattr(_x, '_cg_location'):
+                        # Test for primitives
+                        setattr(_x, '_cg_location', None)
+                        setattr(_x, '_cg_location', (self._graph.push(ComputationGraphNode(_x)).pop(), "o0"))
+                    x_node, x_port = getattr(_x, '_cg_location')
+                    locations.append((x_node, x_port))
+                    self._graph.edge(x_node, x_port, node, f"i{i}")
+                    setattr(_x, '_cg_location', (node, f"i{i}"))
                 except AttributeError:
                     # `_x` is a builtin type and cannot have fields added to it
                     pass
+            getattr(m, '_cg_input_locations').append(locations)
+        self._graph.push(node)
+
+    def _forward_hook(self, m: Union[nn.Module, FunctionContext], inputs: Tuple[Any], outputs: Any):
+        node = self._graph.pop()
+        for i, x in enumerate(inputs):
+            if not isinstance(x, (list, tuple)):
+                x = [x]
+            locations = getattr(m, '_cg_input_locations')[i]
+            for j, _x in enumerate(x):
+                try:
+                    # Test for primitives
+                    setattr(_x, '_cg_location', None)
+                except AttributeError:
+                    continue
+                x_node, x_port = locations[j]
+                setattr(_x, '_cg_location', (x_node, x_port))
 
         # for each output, mark the node as its creator
         if not isinstance(outputs, tuple):
@@ -148,25 +161,33 @@ class Tracker:
             if not isinstance(y, (list, tuple)):
                 y = [y]
             for _y in y:
-                if hasattr(_y, '_cg_creator') and getattr(_y, '_cg_creator').has_ancestor(node):
-                    self._graph.edge(getattr(_y, '_cg_creator'), getattr(_y, '_cg_creator_port'), node, f"o{i}")
-                setattr(_y, '_cg_creator', node)
-                setattr(_y, '_cg_creator_port', f"o{i}")
+                if hasattr(_y, '_cg_location') and getattr(_y, '_cg_location')[0].has_ancestor(node):
+                    self._graph.edge(getattr(_y, '_cg_location')[0], getattr(_y, '_cg_location')[1], node, f"o{i}")
+                setattr(_y, '_cg_location', (node, f"o{i}"))
 
         # for each param, check if it has a creator and add edge/alignment, then mark this as its creator
         if isinstance(m, nn.Module):
-            pass
-            # TODO
+            if not hasattr(m, '_cg_nodes'):
+                setattr(m, '_cg_nodes', [])
+            for _node in getattr(m, '_cg_nodes'):
+                if _node.parent == node.parent:
+                    node.alignments.append(_node)
+                    # create a container which wraps everything
+            getattr(m, '_cg_nodes').append(node)
 
         # TODO: create data node for output if this is a terminal
 
-    def _wrap_fn(self, f):
+# TODO: deal with in-place ops
+# TODO: squeezenet no classifier
+
+    def _wrap_fn(self, fn):
         def _wrapped(*args, **kwargs):
-            print(f.__name__)
-            self._graph.push(ComputationGraphNode(f, 'fn'))
-            y = f(*args, **kwargs)
-            self._forward_hook(None, args + tuple(kwargs.items()), y)
-            return y
+            ctx = FunctionContext(fn)
+            inputs = args + tuple(kwargs.items())
+            self._forward_pre_hook(ctx, inputs)
+            outputs = fn(*args, **kwargs)
+            self._forward_hook(ctx, inputs, outputs)
+            return outputs
 
         return _wrapped
 
@@ -186,8 +207,7 @@ class Model(nn.Module):
         x = self.l1(x)
         x = self.relu(x)
         x = self.s(x)
-        x = torch.flatten(x)
-        x = self.l2(x)
+        x = self.l1(x)
         return x
 
 

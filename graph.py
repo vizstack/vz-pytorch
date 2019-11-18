@@ -42,9 +42,9 @@ class ComputationGraphNode:
 
         # Create the fragment assembler immediately in case it mutates later
         if isinstance(self._payload, nn.Module):
-            self._view = vz.Token(self._payload.__class__.__name__)
+            self._view = vz.Token(self._payload.__class__.__name__, color='purple')
         elif isinstance(self._payload, torch.Tensor):
-            self._view = vz.Token(f"Tensor{list(self._payload.shape)}")
+            self._view = vz.Token(f"Tensor{list(self._payload.shape)}", color='blue')
         else:
             self._view = vz.view(self._payload)
 
@@ -57,7 +57,7 @@ class ComputationGraphNode:
     def edge(
         self, start_port: str, end: "ComputationGraphNode", end_port: str,
     ):
-        self.edges.append([start_port, end, end_port])
+        self.edges.append((start_port, end, end_port))
 
     def has_ancestor(self, ancestor: "ComputationGraphNode"):
         return ancestor in self.ancestors
@@ -79,7 +79,7 @@ class FunctionContext:
         self.cg_input_locations: List[Tuple[ComputationGraphNode, str]] = []
 
     def __view__(self):
-        return vz.Token(self.fn.__name__)
+        return vz.Token(self.fn.__name__, color='red')
 
 
 _MAGIC_METHODS = [
@@ -190,7 +190,7 @@ class Tracker:
         #     d.node(
         #         node_to_id[node], align_with={"axis": "x", "justify": "north", "nodes": [node_to_id[other]], },
         #     )
-        d.node("0", is_visible=False)
+        d.node("0", is_visible=False, is_interactive=False)
         return d
 
     def model(self, model: nn.Module):

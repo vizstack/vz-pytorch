@@ -1,5 +1,7 @@
 import types
-from typing import List, Optional, Tuple, Any, Union, Dict
+import inspect
+from collections import defaultdict
+from typing import List, Optional, Tuple, Any, Union, Dict, Set
 
 import torch
 import torch.nn as nn
@@ -11,206 +13,331 @@ from vzlogger import connect, get_logger
 
 
 class ComputationGraphNode:
-    def __init__(self, payload: Any, variant: str = 'data'):
+    def __init__(self, payload: Any, variant: str):
         self._payload = payload
-        assert variant in ['module', 'fn', 'data']
+        assert variant in ["call", "data"]
         self._variant = variant
+        if self._variant == "call":
+            assert isinstance(payload, (nn.Module, FunctionContext))
 
         self.parent = None
         self.ancestors = []
         self.alignments = []
         self.temporal_groups = [[]]
-        self.temporal_idx = -1
 
-    def set_ancestors(self, ancestors: List["ComputationGraphNode"]):
-        if len(ancestors) > 0:
-            self.parent = ancestors[-1]
-            self.ancestors = list(ancestors)
-            self.parent.temporal_groups[-1].append(self)
-            self.temporal_idx = len(self.parent.temporal_groups) - 1
+        self.edges: List[Tuple[str, ComputationGraphNode, str]] = []
+
+        self.port_names = defaultdict(lambda: None)
+        if self._variant == "call":
+            fn = payload.forward if isinstance(payload, nn.Module) else payload.fn
+            try:
+                for i, param in enumerate(
+                    filter(
+                        lambda p: not isinstance(payload, nn.Module) or p != "self", inspect.signature(fn).parameters
+                    )
+                ):
+                    self.port_names[f"i{i}"] = param
+            except ValueError:
+                pass
+
+        # Create the fragment assembler immediately in case it mutates later
+        if isinstance(self._payload, nn.Module):
+            self._view = vz.Token(self._payload.__class__.__name__)
+        elif isinstance(self._payload, torch.Tensor):
+            self._view = vz.Token(f"Tensor{list(self._payload.shape)}")
+        else:
+            self._view = vz.view(self._payload)
+
+    def child(self, node: "ComputationGraphNode"):
+        node.ancestors = self.ancestors + [self]
+        node.parent = self
+        self.temporal_groups[-1].append(node)
+        return node
+
+    def edge(
+        self, start_port: str, end: "ComputationGraphNode", end_port: str,
+    ):
+        self.edges.append([start_port, end, end_port])
 
     def has_ancestor(self, ancestor: "ComputationGraphNode"):
         return ancestor in self.ancestors
 
+    def is_expanded(self):
+        return not isinstance(self._payload, nn.Module) or "torch.nn" not in self._payload.__module__
+
     def create_temporal(self):
-        self.temporal_groups.append([])
-        last = self.temporal_groups[-2].pop()
-        last.temporal_idx += 1
-        self.temporal_groups[-1].append(last)
+        if len(self.temporal_groups[-1]) > 0:
+            self.temporal_groups.append([])
 
     def __view__(self):
-        if self._variant == 'module':
-            return vz.Token(self._payload.__class__.__name__)
-        if self._variant == 'fn':
-            return vz.Token(self._payload.fn.__name__)
-        else:
-            return vz.Token(self._payload.__class__.__name__)
-
-
-class ComputationGraph:
-    def __init__(self):
-        # TODO: make this invisible
-        self._root: ComputationGraphNode = ComputationGraphNode('root')
-        self._stack: List[ComputationGraphNode] = [self._root]
-        self._nodes: List[ComputationGraphNode] = [self._root]
-        self._edges = []
-        self._terminals = []
-
-    def push(self, node: ComputationGraphNode) -> "ComputationGraph":
-        node.set_ancestors(self._stack)
-        self._stack.append(node)
-        return self
-
-    def pop(self) -> ComputationGraphNode:
-        node = self._stack.pop()
-        self._nodes.append(node)
-        return node
-
-    def edge(self, start: ComputationGraphNode, start_port: str, end: ComputationGraphNode, end_port: str):
-        self._edges.append([start, start_port, end, end_port])
-
-    def __view__(self):
-        d = vz.Dag()
-        node_to_id = {}
-        for i, n in enumerate(self._nodes):
-            d.node(str(i), flow_direction='south' if len(n.temporal_groups) == 1 else 'east')
-            d.item(n, str(i))
-            node_to_id[n] = str(i)
-            if len(n.temporal_groups) > 1:
-                for t in range(len(n.temporal_groups)):
-                    d.node(f"{i}_{t}", parent=str(i), is_visible=True, flow_direction='south')
-                    d.item(None, f"{i}_{t}")
-        for n in self._nodes:
-            if n.parent:
-                p = f"{node_to_id[n.parent]}_{n.temporal_idx}" if len(n.parent.temporal_groups) > 1 else node_to_id[n.parent]
-                d.node(node_to_id[n], parent=p)
-            for other in n.alignments:
-                d.node(node_to_id[n], align_with={'axis': 'x', 'justify': 'north', 'nodes': [node_to_id[other]]})
-            print(node_to_id[n], len(n.temporal_groups))
-        for edge in self._edges:
-            d.port(node_to_id[edge[0]], edge[1], side='south' if edge[1].startswith('o') else 'north', order=int(edge[1][1:]))
-            d.port(node_to_id[edge[2]], edge[3], side='south' if edge[3].startswith('o') else 'north', order=int(edge[3][1:]))
-            d.edge({
-                'id': node_to_id[edge[0]],
-                'port': edge[1],
-            }, {
-                'id': node_to_id[edge[2]],
-                'port': edge[3],
-            })
-        return d
+        return self._view
 
 
 class FunctionContext:
     def __init__(self, fn):
         self.fn = fn
+        self.cg_input_locations: List[Tuple[ComputationGraphNode, str]] = []
+
+    def __view__(self):
+        return vz.Token(self.fn.__name__)
+
+
+_MAGIC_METHODS = [
+    "__add__",
+    "__sub__",
+    "__mul__",
+    "__div__",
+    "__floordiv__",
+    "__truediv__",
+    "__mod__",
+    "__divmod__",
+    "__pow__",
+    "__lshift__",
+    "__rshift__",
+    "__and__",
+    "__or__",
+    "__xor__",
+    "__getitem__",
+]
+_MAGIC_METHODS += ["__r" + fn_name.lstrip("__") for fn_name in _MAGIC_METHODS]
 
 
 class Tracker:
     def __init__(self, models: Optional[List[nn.Module]] = None):
         self._models = models if models is not None else []
-        self._graph: Optional[ComputationGraph] = None
-        self._old_modules = dict()
+        self._node: Optional[ComputationGraphNode] = None
+        self._old_modules: Dict[str, Dict[str, Any]] = dict()
 
     def start(self) -> None:
-        self._graph = ComputationGraph()
-        self._old_modules['torch'] = dict()
+        self._node = ComputationGraphNode(None, "data")
+        self._old_modules["torch"] = dict()
+        self._old_modules["torch.Tensor"] = dict()
         for var, value in vars(torch).items():
-            if callable(value):
+            if callable(value) and not inspect.isclass(value):
                 setattr(torch, var, self._wrap_fn(value))
-            self._old_modules['torch'][var] = value
+                self._old_modules["torch"][var] = value
+
+        for var in dir(torch.Tensor):
+            value = getattr(torch.Tensor, var)
+            if callable(value) and var in _MAGIC_METHODS:
+                setattr(torch.Tensor, var, self._wrap_fn(value))
+                self._old_modules["torch.Tensor"][var] = value
         for model in self._models:
             for module in model.modules():
-                module.register_forward_pre_hook(self._forward_pre_hook)
-                module.register_forward_hook(self._forward_hook)
+                module.register_forward_pre_hook(self._on_call)
+                module.register_forward_hook(self._on_return)
 
-    def stop(self) -> ComputationGraph:
-        graph = self._graph
-        self._graph = None
-        for var, value in self._old_modules['torch'].items():
+    def finish(self):
+        nodes = [(self._node, None)]
+        self._node = None
+        for var, value in self._old_modules["torch"].items():
             setattr(torch, var, value)
+        for var, value in self._old_modules["torch.Tensor"].items():
+            setattr(torch.Tensor, var, value)
         # TODO: remove all hooks
-        return graph
+
+        d = vz.Dag()
+        node_to_id = {}
+        while len(nodes) > 0:
+            node, parent = nodes.pop()
+            node_to_id[node] = str(len(node_to_id))
+            print(node_to_id[node], len(node.temporal_groups))
+            d.node(
+                node_to_id[node],
+                parent=parent,
+                item=node,
+                is_expanded=node.is_expanded(),
+                flow_direction="south" if len(node.temporal_groups) == 1 else "east",
+            )
+            if len(node.temporal_groups) > 1:
+                for t in range(len(node.temporal_groups)):
+                    d.node(
+                        f"{node_to_id[node]}_{t}",
+                        parent=node_to_id[node],
+                        is_interactive=False,
+                        flow_direction="south",
+                    )
+                    d.item(None, f"{node_to_id[node]}_{t}")
+                    for child in node.temporal_groups[t]:
+                        nodes.append((child, f"{node_to_id[node]}_{t}"))
+            else:
+                for child in node.temporal_groups[0]:
+                    nodes.append((child, node_to_id[node]))
+        for node in node_to_id:
+            for edge in node.edges:
+                start_port, end_node, end_port = edge
+                if end_node not in node_to_id:
+                    continue
+                d.port(
+                    node_to_id[node],
+                    start_port,
+                    side="south" if start_port.startswith("o") else "north",
+                    order=int(start_port[1:]),
+                    label=node.port_names[start_port],
+                )
+                d.port(
+                    node_to_id[end_node],
+                    end_port,
+                    side="south" if end_port.startswith("o") else "north",
+                    order=int(end_port[1:]),
+                    label=end_node.port_names[end_port],
+                )
+                d.edge(
+                    {"id": node_to_id[node], "port": start_port,}, {"id": node_to_id[end_node], "port": end_port,},
+                )
+        # TODO: alignments
+        # for other in node.alignments:
+        #     d.node(
+        #         node_to_id[node], align_with={"axis": "x", "justify": "north", "nodes": [node_to_id[other]], },
+        #     )
+        d.node("0", is_visible=False)
+        return d
 
     def model(self, model: nn.Module):
         self._models.append(model)
 
-    def _forward_pre_hook(self, m: Union[nn.Module, FunctionContext], inputs: Tuple[Any, ...]):
-        node = ComputationGraphNode(m, 'module' if isinstance(m, nn.Module) else 'fn')
-        # for each input, create a data node if it has no creator, then create an edge to the correct port
-        setattr(m, '_cg_input_locations', [])
-        for i, x in enumerate(inputs):
-            if not isinstance(x, (list, tuple)):
-                x = [x]
-            locations = []
-            for _x in x:
-                try:
-                    if not hasattr(_x, '_cg_location'):
-                        # Test for primitives
-                        setattr(_x, '_cg_location', None)
-                        setattr(_x, '_cg_location', (self._graph.push(ComputationGraphNode(_x)).pop(), "o0"))
-                    x_node, x_port = getattr(_x, '_cg_location')
-                    locations.append((x_node, x_port))
-                    self._graph.edge(x_node, x_port, node, f"i{i}")
-                    setattr(_x, '_cg_location', (node, f"i{i}"))
-                except AttributeError:
-                    # `_x` is a builtin type and cannot have fields added to it
-                    pass
-            getattr(m, '_cg_input_locations').append(locations)
-        self._graph.push(node)
+    def tick(self):
+        self._node.create_temporal()
 
-    def _forward_hook(self, m: Union[nn.Module, FunctionContext], inputs: Tuple[Any], outputs: Any):
-        node = self._graph.pop()
-        for i, x in enumerate(inputs):
-            if not isinstance(x, (list, tuple)):
-                x = [x]
-            locations = getattr(m, '_cg_input_locations')[i]
-            for j, _x in enumerate(x):
+    def _on_call(self, fn: Union[nn.Module, FunctionContext], arguments: Tuple[Any, ...]):
+        call_node = self._node.child(ComputationGraphNode(fn, "call"))
+
+        argument_locations: List[List[Tuple[ComputationGraphNode, str]]] = []
+        for i, arg in enumerate(arguments):
+            # We do "iterable cracking" by default, so if the argument isn't an iterable already, make it one
+            arg_iterable: Union[List[Any], Tuple[Any]]
+            if not isinstance(arg, (list, tuple)):
+                arg_iterable = (arg,)
+            else:
+                arg_iterable = arg
+            arg_iterable_locations: List[Tuple[ComputationGraphNode, str]] = []
+            for arg_value in arg_iterable:
                 try:
-                    # Test for primitives
-                    setattr(_x, '_cg_location', None)
+                    # If the argument value has never been seen in the graph before, create a new node for it
+                    if not hasattr(arg_value, "cg_location"):
+                        # Test for primitives. If we don't try to set `cg_location` to a dummy value first, the new
+                        # data node will be created before `cg_location` is set, causing there to be an extraneous
+                        # data node connected to nothing.
+                        # TODO: should we create data nodes for these primitives anyway?
+                        arg_value.cg_location = None
+                        arg_value.cg_location = (
+                            self._node.child(ComputationGraphNode(arg_value, "data")),
+                            "o0",
+                        )
+                    # Create an edge from the value's current location to `call_node`, set its new current location to
+                    # be `call_node`, then cache its old location on `call_node` so that, when it returns, it can reset
+                    # the value's location.
+                    arg_iterable_locations.append(arg_value.cg_location)
+                    start_node, start_port = arg_value.cg_location
+                    start_node.edge(start_port, call_node, f"i{i}")
+                    arg_value.cg_location = (call_node, f"i{i}")
+                except AttributeError:
+                    # `arg_value` is a primitive type and cannot have fields added to it
+                    pass
+            argument_locations.append(arg_iterable_locations)
+        fn.cg_input_locations = argument_locations
+        self._node = call_node
+
+    def _on_return(self, fn: Union[nn.Module, FunctionContext], arguments: Tuple[Any], outputs: Any):
+        print(self._node)
+        for i, arg in enumerate(arguments):
+            # We do "iterable cracking" by default, so if the argument isn't an iterable already, make it one
+            arg_iterable: Union[List[Any], Tuple[Any]]
+            if not isinstance(arg, (list, tuple)):
+                arg_iterable = (arg,)
+            else:
+                arg_iterable = arg
+            input_locations = fn.cg_input_locations[i]
+            for j, arg_value in enumerate(arg_iterable):
+                try:
+                    # Test for primitives. If we don't set `cg_location` to a dummy value first, then `input_locations`
+                    # will be indexed into at element `j` first, which will not exist if `arg_value` was a primitive and
+                    # thus added no input location in `_on_call()`.
+                    arg_value.cg_location = None
+                    arg_value.cg_location = input_locations[j]
                 except AttributeError:
                     continue
-                x_node, x_port = locations[j]
-                setattr(_x, '_cg_location', (x_node, x_port))
 
-        # for each output, mark the node as its creator
+        # We do "iterable cracking" by default, so if there's only one output, make it a single-element tuple
         if not isinstance(outputs, tuple):
-            outputs = [outputs]
-        for i, y in enumerate(outputs):
-            if not isinstance(y, (list, tuple)):
-                y = [y]
-            for _y in y:
-                if hasattr(_y, '_cg_location') and getattr(_y, '_cg_location')[0].has_ancestor(node):
-                    self._graph.edge(getattr(_y, '_cg_location')[0], getattr(_y, '_cg_location')[1], node, f"o{i}")
-                setattr(_y, '_cg_location', (node, f"o{i}"))
+            outputs = (outputs,)
+        for i, output in enumerate(outputs):
+            # We do "iterable cracking" by default, so if the output isn't an iterable already, make it one
+            output_iterable: Union[List[Any], Tuple[Any]]
+            if not isinstance(output, (list, tuple)):
+                output_iterable = (output,)
+            else:
+                output_iterable = output
+            for output_value in output_iterable:
+                # If the output value has a current location in the graph and that location is a descendant of
+                # `call_node`, then add an edge from that descendant to this node's output port
+                if hasattr(output_value, "cg_location") and output_value.cg_location[0].has_ancestor(self._node):
+                    start_node, start_port = output_value.cg_location
+                    start_node.edge(start_port, self._node, f"o{i}")
+                data_node = self._node.parent.child(ComputationGraphNode(output_value, "data"))
+                self._node.edge(f"o{i}", data_node, "i0")
+                output_value.cg_location = (data_node, "o0")
+        self._node = self._node.parent
 
-        # for each param, check if it has a creator and add edge/alignment, then mark this as its creator
-        if isinstance(m, nn.Module):
-            # if not hasattr(m, '_cg_nodes'):
-            #     setattr(m, '_cg_nodes', [])
-            for _node in node.parent.temporal_groups[-1]:
-                if node != _node and _node._payload == node._payload:
-                    # trigger a new temporal creation
-                    node.parent.create_temporal()
-                    node.alignments.append(_node)
-                    # create a container which wraps everything
-            # getattr(m, '_cg_nodes').append(node)
-
-        # TODO: create data node for output if this is a terminal
-
-# TODO: deal with in-place ops
-# TODO: squeezenet no classifier
+    # TODO: cleanup graph and node and separate out functions
+    # TODO: primitive inputs (i.e., integers into __getitem__)
+    # TODO: don't duplicate data nodes when they get passed through parent interface
+    # TODO: deal with in-place ops (maybe done?)
+    # TODO: make modules return subclassed primitives (why?)
 
     def _wrap_fn(self, fn):
         def _wrapped(*args, **kwargs):
             ctx = FunctionContext(fn)
             inputs = args + tuple(kwargs.items())
-            self._forward_pre_hook(ctx, inputs)
+            self._on_call(ctx, inputs)
             outputs = fn(*args, **kwargs)
-            self._forward_hook(ctx, inputs, outputs)
+            is_output_iterable = isinstance(outputs, (list, tuple))
+            if not is_output_iterable:
+                outputs = (outputs,)
+            has_tensor = any([isinstance(output, torch.Tensor) for output in outputs])
+            if not is_output_iterable:
+                outputs = outputs[0]
+            self._on_return(ctx, inputs, outputs)
             return outputs
 
         return _wrapped
+
+
+_tracker = None
+
+
+def start(model):
+    global _tracker
+    assert _tracker is None
+    _tracker = Tracker(models=[model])
+    _tracker.start()
+
+
+def finish():
+    global _tracker
+    assert _tracker is not None
+    return _tracker.finish()
+
+
+def tick():
+    global _tracker
+    assert _tracker is not None
+    _tracker.tick()
+
+
+# Whenever a module gets called:
+# PRE-HOOK
+# 1. create a node with the module as payload
+# 2. if the current parent on the stack has a child with the same payload, create a new temporal container
+# 3. for each input, check if it has a location (a node-port pair);
+#   if not, create a new data node for it and make that its location
+#   then, cache old location on the module and set its location to the input port of the module node, creating an edge
+# 4. set module ancestors and add it to the stack
+# POST-HOOK
+# 1. pop the node off of the stack
+# 2. for each input, set its location back to the cached location
+# OLD 3. for each output, set its location to the module's output port
+# NEW 3. for each output, create a data node and set its location to the data node
 
 
 class Model(nn.Module):
@@ -218,38 +345,56 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.l1 = nn.Linear(128, 128)
         self.relu = nn.ReLU()
-        self.s = nn.Sequential(
-            nn.ReLU(),
-            nn.ELU(),
-        )
+        self.s = nn.Sequential(nn.ReLU(), nn.ELU(),)
         self.l2 = nn.Linear(128, 128)
 
     def forward(self, x):
+        tick()
         x = self.l1(x)
         x = F.relu(x)
+        tick()
         x = self.l1(x)
         x = F.relu(x)
+        tick()
         x = self.l1(x)
         x = F.relu(x)
         return x
 
-# Each parent maintains its own temporal steps
-# Whenever a new copy of anode is created within a given parent, wrap everything up to the last temporal boundary in a new temporal container
+
+class LSTM(nn.Module):
+    def __init__(self):
+        super(LSTM, self).__init__()
+        self.cell = nn.LSTMCell(64, 128)
+
+    def forward(self, x):
+        outputs = []
+        h, c = None, None
+        for i in range(x.shape[1]):
+            tick()
+            if h is None:
+                h, c = self.cell(x[:, i, :])
+            else:
+                h, c = self.cell(x[:, i, :], (h, c))
+            outputs.append(h)
+        return torch.stack(outputs, dim=1)
+
 
 def main():
-    model = Model()
+    # model = Model()
     # model = tvmodels.squeezenet1_0()
+    model = LSTM()
+    # model = nn.Transformer(d_model=64)
     print(model)
-    tracker = Tracker()
-    tracker.model(model)
-    tracker.start()
+    start(model)
+    model(torch.rand(1, 3, 64))
+    # model(torch.rand(1, 10, 64), torch.rand(1, 10, 64))
     # model(torch.rand((1, 3, 224, 224)))
-    model(torch.rand(1, 128))
-    graph = tracker.stop()
-    with connect():
-        get_logger('main').info(graph)
-    print(str(vz.assemble(graph)).replace('None', 'null').replace('False', 'false').replace('True', 'true'))
+    # model(torch.rand(1, 128))
+    graph = finish()
+    # with connect():
+    #     get_logger('main').info(graph)
+    print(str(vz.assemble(graph)).replace("None", "null").replace("False", "false").replace("True", "true"))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

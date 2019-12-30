@@ -1,1 +1,6 @@
 .idea/
+
+# Python
+*.egg-info/
+__pycache__/
+dist/

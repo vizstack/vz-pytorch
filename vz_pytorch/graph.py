@@ -6,10 +6,14 @@ from typing import List, Optional, Tuple, Any, Union, Dict, Set
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as tvmodels
+# import torchvision.models as tvmodels
 
 import vizstack as vz
 from vzlogger import connect, get_logger
+
+from vz_pytorch.special_functions import FUNCTIONS as special_functions
+
+__all__ = ["start", "finish", "tick"]
 
 
 class ComputationGraphNode:
@@ -77,9 +81,10 @@ class FunctionContext:
     def __init__(self, fn):
         self.fn = fn
         self.cg_input_locations: List[Tuple[ComputationGraphNode, str]] = []
+        self.text = self.fn.__name__
 
     def __view__(self):
-        return vz.Token(self.fn.__name__, color='red')
+        return vz.Token(self.text, color='red')
 
 
 _MAGIC_METHODS = [
@@ -100,6 +105,7 @@ _MAGIC_METHODS = [
     "__getitem__",
 ]
 _MAGIC_METHODS += ["__r" + fn_name.lstrip("__") for fn_name in _MAGIC_METHODS]
+_MAGIC_METHODS += ["__i" + fn_name.lstrip("__") for fn_name in _MAGIC_METHODS]
 
 
 class Tracker:
@@ -141,7 +147,7 @@ class Tracker:
         while len(nodes) > 0:
             node, parent = nodes.pop()
             node_to_id[node] = str(len(node_to_id))
-            print(node_to_id[node], len(node.temporal_groups))
+            # print(len(node_to_id))
             d.node(
                 node_to_id[node],
                 parent=parent,
@@ -233,13 +239,13 @@ class Tracker:
                     arg_value.cg_location = (call_node, f"i{i}")
                 except AttributeError:
                     # `arg_value` is a primitive type and cannot have fields added to it
-                    pass
+                    data_node = self._node.child(ComputationGraphNode(arg_value, "data"))
+                    data_node.edge("o0", call_node, f"i{i}")
             argument_locations.append(arg_iterable_locations)
         fn.cg_input_locations = argument_locations
         self._node = call_node
 
     def _on_return(self, fn: Union[nn.Module, FunctionContext], arguments: Tuple[Any], outputs: Any):
-        print(self._node)
         for i, arg in enumerate(arguments):
             # We do "iterable cracking" by default, so if the argument isn't an iterable already, make it one
             arg_iterable: Union[List[Any], Tuple[Any]]
@@ -274,11 +280,18 @@ class Tracker:
                 if hasattr(output_value, "cg_location") and output_value.cg_location[0].has_ancestor(self._node):
                     start_node, start_port = output_value.cg_location
                     start_node.edge(start_port, self._node, f"o{i}")
+
                 data_node = self._node.parent.child(ComputationGraphNode(output_value, "data"))
                 self._node.edge(f"o{i}", data_node, "i0")
-                output_value.cg_location = (data_node, "o0")
+                try:
+                    output_value.cg_location = (data_node, "o0")
+                except AttributeError:
+                    # The output is a primitive and cannot have a location
+                    pass
         self._node = self._node.parent
 
+    # TODO: show cracked list arguments in correct order with constraints somehow
+    # TODO: make it so printing doesnt create hundreds of extra nodes
     # TODO: cleanup graph and node and separate out functions
     # TODO: primitive inputs (i.e., integers into __getitem__)
     # TODO: don't duplicate data nodes when they get passed through parent interface
@@ -288,7 +301,12 @@ class Tracker:
     def _wrap_fn(self, fn):
         def _wrapped(*args, **kwargs):
             ctx = FunctionContext(fn)
-            inputs = args + tuple(kwargs.items())
+            print(fn.__name__)
+            if fn.__name__ not in special_functions:
+                inputs = args + tuple(kwargs.values())
+            else:
+                inputs, ctx.text = special_functions[fn.__name__](args, kwargs)
+                print(ctx.text)
             self._on_call(ctx, inputs)
             outputs = fn(*args, **kwargs)
             is_output_iterable = isinstance(outputs, (list, tuple))
@@ -375,6 +393,7 @@ class LSTM(nn.Module):
                 h, c = self.cell(x[:, i, :])
             else:
                 h, c = self.cell(x[:, i, :], (h, c))
+            h /= 2
             outputs.append(h)
         return torch.stack(outputs, dim=1)
 
@@ -383,16 +402,18 @@ def main():
     # model = Model()
     # model = tvmodels.squeezenet1_0()
     model = LSTM()
+    # model = nn.Linear(10, 20)
     # model = nn.Transformer(d_model=64)
     print(model)
     start(model)
+    # model(torch.rand(5, 10))
     model(torch.rand(1, 3, 64))
     # model(torch.rand(1, 10, 64), torch.rand(1, 10, 64))
     # model(torch.rand((1, 3, 224, 224)))
     # model(torch.rand(1, 128))
     graph = finish()
-    # with connect():
-    #     get_logger('main').info(graph)
+    with connect('http://34.94.109.120:80'):
+        get_logger('main').info(graph)
     print(str(vz.assemble(graph)).replace("None", "null").replace("False", "false").replace("True", "true"))
 
 

@@ -48,7 +48,9 @@ class ComputationGraphNode:
         if isinstance(self._payload, nn.Module):
             self._view = vz.Token(self._payload.__class__.__name__, color='purple')
         elif isinstance(self._payload, torch.Tensor):
-            self._view = vz.Token(f"Tensor{list(self._payload.shape)}", color='blue')
+            self._view = vz.Switch(['shape', 'values'], {
+                'shape': vz.Token(f"Tensor{list(self._payload.shape)}", color='blue'),
+            })
         else:
             self._view = vz.view(self._payload)
 
@@ -74,6 +76,9 @@ class ComputationGraphNode:
             self.temporal_groups.append([])
 
     def __view__(self):
+        # TODO We can't do this on initialization, since it currently causes an infinite loop of tracked functions
+        if isinstance(self._payload, torch.Tensor):
+            self._view.item('values', str(self._payload))
         return self._view
 
 
@@ -111,6 +116,7 @@ _MAGIC_METHODS += ["__i" + fn_name.lstrip("__") for fn_name in _MAGIC_METHODS]
 class Tracker:
     def __init__(self, models: Optional[List[nn.Module]] = None):
         self._models = models if models is not None else []
+        self._hooks = []
         self._node: Optional[ComputationGraphNode] = None
         self._old_modules: Dict[str, Dict[str, Any]] = dict()
 
@@ -130,8 +136,8 @@ class Tracker:
                 self._old_modules["torch.Tensor"][var] = value
         for model in self._models:
             for module in model.modules():
-                module.register_forward_pre_hook(self._on_call)
-                module.register_forward_hook(self._on_return)
+                self._hooks.append(module.register_forward_pre_hook(self._on_call))
+                self._hooks.append(module.register_forward_hook(self._on_return))
 
     def finish(self):
         nodes = [(self._node, None)]
@@ -140,7 +146,8 @@ class Tracker:
             setattr(torch, var, value)
         for var, value in self._old_modules["torch.Tensor"].items():
             setattr(torch.Tensor, var, value)
-        # TODO: remove all hooks
+        for hook in self._hooks:
+            hook.remove()
 
         d = vz.Dag()
         node_to_id = {}

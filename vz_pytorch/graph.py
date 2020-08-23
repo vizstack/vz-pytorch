@@ -25,7 +25,6 @@ class ComputationGraphNode:
 
         self.parent = None
         self.ancestors = []
-        self.alignments = []
         self.temporal_groups = [[]]
 
         self.edges: List[Tuple[str, ComputationGraphNode, str]] = []
@@ -45,39 +44,44 @@ class ComputationGraphNode:
                 pass
 
         self._view = None
-        self._token_text = None
-        self._token_color = None
+        self._label_args = None
         self._tags = []
         # Create the fragment assembler immediately in case it mutates later
         if isinstance(self._payload, nn.Module):
-            self._token_text = self._payload.__class__.__name__
-            self._token_color = "purple"
-            # self._view = vz.Token(self._payload.__class__.__name__, color="purple")
+            self._label_args = {"text": self._payload.__class__.__name__, "color": "purple"}
         elif isinstance(self._payload, torch.Tensor):
             try:
+                # Check if this is a parameter or directly derived from a parameter
                 if isinstance(self._payload, nn.Parameter) or (
                     len(self._payload.grad_fn.next_functions) == 1
                     and "AccumulateGrad" in str(self._payload.grad_fn.next_functions[0][0].name)
                 ):
-                    self._token_text = f"Parameter{list(self._payload.shape)}"
-                    self._token_color = "green"
-                    # self._view = vz.Switch(['shape', 'values'], {
-                    #     'shape': vz.Token(f"Tensor{list(self._payload.shape)}", color='blue'),
-                    # })
+                    self._label_args = {
+                        "text": f"Parameter{list(self._payload.shape)}",
+                        "color": "green",
+                    }
             except AttributeError:
                 pass
-            if self._token_text is None:
-                self._token_text = f"Tensor{list(self._payload.shape)}"
-                self._token_color = "blue"
+            if self._label_args is None:
+                self._label_args = {
+                    "text": f"Tensor{list(self._payload.shape)}",
+                    "color": "blue",
+                }
         elif isinstance(self._payload, (float, int)):
-            self._token_text = str(self._payload)
-            self._token_color = "orange"
+            self._label_args = {
+                "text": str(self._payload),
+                "color": "orange",
+            }
         else:
             self._view = vz.view(self._payload)
+
+        # If the data has been relabeled, apply the label
         try:
             self.label(self._payload.cg_label)
         except AttributeError:
             pass
+
+        # If any tags have been added to the data, apply those tags
         try:
             for tag, kind in self._payload.cg_tags:
                 self.tag(tag, kind)
@@ -102,14 +106,16 @@ class ComputationGraphNode:
 
     def label(self, label):
         assert self._variant == "data"
-        if self._token_text is not None:
-            self._token_text = f"{label}"
+        if self._label_args is not None:
+            self._label_args["text"] = f"{label}"
 
     def tag(self, tag, kind):
         if kind == "image":
             self._tags.append(vz.Image(tag))
         elif kind == "text":
-            self._tags.append(vz.Token(str(tag), color=self._token_color))
+            self._tags.append(
+                vz.Token(str(tag), color=self._label_args["color"] if self._label_args is not None else "blue")
+            )
         else:
             raise ValueError(f"Unsupported tag of kind {kind}.")
 
@@ -158,21 +164,12 @@ class ComputationGraphNode:
 
     def __view__(self):
         # TODO We can't do this on initialization, since it currently causes an infinite loop of tracked functions
-        # if isinstance(self._payload, torch.Tensor):
-        #     self._view.item('values', str(self._payload))
-        if self._token_text is not None:
-            self._view = vz.Token(self._token_text, color=self._token_color)
+        if self._label_args is not None:
+            self._view = vz.Token(**self._label_args)
             if len(self._tags) > 0:
                 self._view = vz.Switch(["label"] + [str(i) for i in range(len(self._tags))], {"label": self._view})
                 for i, tag in enumerate(self._tags):
                     self._view.item(str(i), tag)
-            # if isinstance(self._payload, torch.Tensor):
-                # plt.hist(self._payload.detach().numpy().flatten())
-                # plt.title("Distribution of values")
-                # plt.ylabel("Number of elements")
-                # plt.tight_layout()
-                # pic_hash = plt_to_bytes()
-                # plt.clf()
         return self._view
 
 
@@ -254,14 +251,13 @@ class Tracker:
             if not node.replace_with_edges():
                 node_to_id[node] = str(len(node_to_id))
                 node_to_parent[node] = parent
-                # print(len(node_to_id))
                 d.node(
                     node_to_id[node],
                     parent=parent,
                     item=node,
                     is_expanded=node.is_expanded(),
                     flow_direction="south" if len(node.temporal_groups) == 1 else "east",
-                    label=node._token_text,
+                    label=node._label_args["text"] if node._label_args is not None else None,
                 )
                 if len(node.temporal_groups) > 1:
                     for t in range(len(node.temporal_groups)):
@@ -440,25 +436,22 @@ class Tracker:
     # TODO: cleanup graph and node and separate out functions
     # TODO: primitive inputs (i.e., integers into __getitem__)
     # TODO: deal with in-place ops (maybe done?)
-    # TODO: make modules return subclassed primitives (why?)
+    # TODO: make modules return subclassed primitives so they can be used as inputs later
 
     def _wrap_fn(self, fn):
         def _wrapped(*args, **kwargs):
             if self._paused:
                 return fn(*args, **kwargs)
             ctx = FunctionContext(fn)
-            # print(fn.__name__)
             if fn.__name__ not in special_functions:
                 inputs = args + tuple(kwargs.values())
             else:
                 inputs, ctx.text = special_functions[fn.__name__](args, kwargs)
-                # print(ctx.text)
             self._on_call(ctx, inputs)
             outputs = fn(*args, **kwargs)
             is_output_iterable = isinstance(outputs, (list, tuple))
             if not is_output_iterable:
                 outputs = (outputs,)
-            has_tensor = any([isinstance(output, torch.Tensor) for output in outputs])
             if not is_output_iterable:
                 outputs = outputs[0]
             self._on_return(ctx, inputs, outputs)
@@ -515,65 +508,3 @@ def pause():
     if _tracker is not None:
         with _tracker.pause():
             yield
-
-
-# Whenever a module gets called:
-# PRE-HOOK
-# 1. create a node with the module as payload
-# 2. if the current parent on the stack has a child with the same payload, create a new temporal container
-# 3. for each input, check if it has a location (a node-port pair);
-#   if not, create a new data node for it and make that its location
-#   then, cache old location on the module and set its location to the input port of the module node, creating an edge
-# 4. set module ancestors and add it to the stack
-# POST-HOOK
-# 1. pop the node off of the stack
-# 2. for each input, set its location back to the cached location
-# OLD 3. for each output, set its location to the module's output port
-# NEW 3. for each output, create a data node and set its location to the data node
-
-# class Model(nn.Module):
-#     def __init__(self):
-#         super(Model, self).__init__()
-#         self.l1 = nn.Linear(128, 128)
-#         self.relu = nn.ReLU()
-#         self.s = nn.Sequential(nn.ReLU(), nn.ELU(),)
-#         self.l2 = nn.Linear(128, 128)
-#
-#     def forward(self, x):
-#         tick()
-#         x = self.l1(x)
-#         x = F.relu(x)
-#         tick()
-#         x = self.l1(x)
-#         x = F.relu(x)
-#         tick()
-#         x = self.l1(x)
-#         x = F.relu(x)
-#         return x
-
-
-def main():
-    # model = SimpleFeedforward()
-    model = LSTM()
-    # model = tvmodels.resnet18().eval()
-    # model = nn.Transformer(d_model=64, num_encoder_layers=2, num_decoder_layers=2, nhead=2).eval()
-    print(model)
-    start(model)
-    x = torch.rand(1, 3, 64)
-    x = x - torch.mean(x)
-    # model(torch.rand(1, 64))
-    model(x)
-    # model(torch.rand(1, 3, 16, 16))
-    # model(torch.rand(1, 3, 64), torch.rand(1, 3, 64))
-    graph = finish()
-    with connect("http://localhost:4000"):
-        get_logger("main").info(graph)
-
-    # writer = SummaryWriter("tb")
-    # writer.add_graph(model, [torch.rand(1, 3, 64), torch.rand(1, 3, 64)])
-    # writer.close()
-    # print(str(vz.assemble(graph)).replace("None", "null").replace("False", "false").replace("True", "true"))
-
-
-if __name__ == "__main__":
-    main()

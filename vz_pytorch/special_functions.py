@@ -16,9 +16,12 @@ def _binary_op(op, flip=False):
 
 
 def _getitem(args, kwargs) -> Tuple[Tuple[Any], str]:
+    indices = args[1]
+    if isinstance(args[1], slice):
+        indices = [args[1]]
     return (
         (args[0],),
-        f"self[{', '.join([_slice_notation(s) if isinstance(s, slice) else str(s) for s in args[1]]) if not isinstance(args[1], slice) else _slice_notation(args[1])}]",
+        f"self[{', '.join([_slice_notation(s) if isinstance(s, slice) else str(s) for s in indices])}]",
     )
 
 

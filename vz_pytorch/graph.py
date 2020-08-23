@@ -11,7 +11,7 @@ import vizstack as vz
 
 from vz_pytorch.special_functions import FUNCTIONS as special_functions
 
-__all__ = ["start", "finish", "tracking", "tick", "label", "tag", "pause"]
+__all__ = ["start", "stop", "tracking", "tick", "name", "tag", "tag_image", "pause"]
 
 
 class ComputationGraphNode:
@@ -76,7 +76,7 @@ class ComputationGraphNode:
 
         # If the data has been relabeled, apply the label
         try:
-            self.label(self._payload.cg_label)
+            self.name(self._payload.cg_name)
         except AttributeError:
             pass
 
@@ -103,10 +103,10 @@ class ComputationGraphNode:
         self.edges.remove((start_port, end, end_port))
         end.edges_to.remove((self, start_port, end_port))
 
-    def label(self, label):
+    def name(self, name):
         assert self._variant == "data"
         if self._label_args is not None:
-            self._label_args["text"] = f"{label}"
+            self._label_args["text"] = f"{name}"
 
     def tag(self, tag, kind):
         if kind == "image":
@@ -232,7 +232,7 @@ class Tracker:
                 self._hooks.append(module.register_forward_pre_hook(self._on_call))
                 self._hooks.append(module.register_forward_hook(self._on_return))
 
-    def finish(self):
+    def stop(self):
         nodes = [(self._node, None)]
         self._node = None
         for var, value in self._old_modules["torch"].items():
@@ -320,20 +320,29 @@ class Tracker:
         if self._node is not None:
             self._node.create_temporal()
 
-    def label(self, data, label):
+    def name(self, data, name):
         try:
-            data.cg_label = label
-            data.cg_location[0].label(label)
+            data.cg_name = name
+            data.cg_location[0].name(name)
         except AttributeError:
             pass
 
-    def tag(self, data, tag, kind):
+    def tag(self, data, tag):
         try:
             if not hasattr(data, "cg_tags"):
                 data.cg_tags = []
-            data.cg_tags.append((tag, kind))
-            data.cg_location[0].tag(tag, kind)
-        except AttributeError as e:
+            data.cg_tags.append((tag, "text"))
+            data.cg_location[0].tag(tag, "text")
+        except AttributeError:
+            pass
+
+    def tag_image(self, data, image_str):
+        try:
+            if not hasattr(data, "cg_tags"):
+                data.cg_tags = []
+            data.cg_tags.append((image_str, "image"))
+            data.cg_location[0].tag(image_str, "image")
+        except AttributeError:
             pass
 
     @contextmanager
@@ -470,10 +479,10 @@ def start(model):
     _tracker.start()
 
 
-def finish():
+def stop():
     global _tracker
     assert _tracker is not None
-    output = _tracker.finish()
+    output = _tracker.stop()
     _tracker = None
     return output
 
@@ -484,16 +493,22 @@ def tick():
         _tracker.tick()
 
 
-def label(data, label):
+def name(data, name):
     global _tracker
     if _tracker is not None:
-        _tracker.label(data, label)
+        _tracker.name(data, name)
 
 
-def tag(data, tag, kind):
+def tag(data, tag):
     global _tracker
     if _tracker is not None:
-        _tracker.tag(data, tag, kind)
+        _tracker.tag(data, tag)
+
+
+def tag_image(data, image):
+    global _tracker
+    if _tracker is not None:
+        _tracker.tag_image(data, image)
 
 
 def tracking():

@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 
 import vizstack as vz
-from vzlogger import connect, get_logger
 
 from vz_pytorch.special_functions import FUNCTIONS as special_functions
 

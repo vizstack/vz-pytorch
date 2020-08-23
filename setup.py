@@ -11,7 +11,7 @@ setup(
     zip_safe=False,
     author='Ryan Holmdahl & Nikhil Bhattasali',
     author_email='vizstack@gmail.com',
-    install_requires=['vizstack-py', 'torch', 'vz-logger'],
+    install_requires=['vizstack-py', 'torch'],
     description="Create Vizstack visualizations of Pytorch models.",
     url='https://github.com/vizstack/vz-pytorch',
     long_description=long_description,

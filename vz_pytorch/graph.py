@@ -1,19 +1,18 @@
-import types
 import inspect
+
+from typing import List, Optional, Tuple, Any, Union, Dict
+from contextlib import contextmanager
 from collections import defaultdict
-from typing import List, Optional, Tuple, Any, Union, Dict, Set
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-# import torchvision.models as tvmodels
 
 import vizstack as vz
 from vzlogger import connect, get_logger
 
 from vz_pytorch.special_functions import FUNCTIONS as special_functions
 
-__all__ = ["start", "finish", "tick"]
+__all__ = ["start", "finish", "tracking", "tick", "label", "tag", "pause"]
 
 
 class ComputationGraphNode:
@@ -30,6 +29,7 @@ class ComputationGraphNode:
         self.temporal_groups = [[]]
 
         self.edges: List[Tuple[str, ComputationGraphNode, str]] = []
+        self.edges_to: List[Tuple[ComputationGraphNode, str, str]] = []
 
         self.port_names = defaultdict(lambda: None)
         if self._variant == "call":
@@ -44,15 +44,45 @@ class ComputationGraphNode:
             except ValueError:
                 pass
 
+        self._view = None
+        self._token_text = None
+        self._token_color = None
+        self._tags = []
         # Create the fragment assembler immediately in case it mutates later
         if isinstance(self._payload, nn.Module):
-            self._view = vz.Token(self._payload.__class__.__name__, color='purple')
+            self._token_text = self._payload.__class__.__name__
+            self._token_color = "purple"
+            # self._view = vz.Token(self._payload.__class__.__name__, color="purple")
         elif isinstance(self._payload, torch.Tensor):
-            self._view = vz.Switch(['shape', 'values'], {
-                'shape': vz.Token(f"Tensor{list(self._payload.shape)}", color='blue'),
-            })
+            try:
+                if isinstance(self._payload, nn.Parameter) or (
+                    len(self._payload.grad_fn.next_functions) == 1
+                    and "AccumulateGrad" in str(self._payload.grad_fn.next_functions[0][0].name)
+                ):
+                    self._token_text = f"Parameter{list(self._payload.shape)}"
+                    self._token_color = "green"
+                    # self._view = vz.Switch(['shape', 'values'], {
+                    #     'shape': vz.Token(f"Tensor{list(self._payload.shape)}", color='blue'),
+                    # })
+            except AttributeError:
+                pass
+            if self._token_text is None:
+                self._token_text = f"Tensor{list(self._payload.shape)}"
+                self._token_color = "blue"
+        elif isinstance(self._payload, (float, int)):
+            self._token_text = str(self._payload)
+            self._token_color = "orange"
         else:
             self._view = vz.view(self._payload)
+        try:
+            self.label(self._payload.cg_label)
+        except AttributeError:
+            pass
+        try:
+            for tag, kind in self._payload.cg_tags:
+                self.tag(tag, kind)
+        except AttributeError:
+            pass
 
     def child(self, node: "ComputationGraphNode"):
         node.ancestors = self.ancestors + [self]
@@ -64,6 +94,57 @@ class ComputationGraphNode:
         self, start_port: str, end: "ComputationGraphNode", end_port: str,
     ):
         self.edges.append((start_port, end, end_port))
+        end.edges_to.append((self, start_port, end_port))
+
+    def remove_edge(self, start_port: str, end: "ComputationGraphNode", end_port: str):
+        self.edges.remove((start_port, end, end_port))
+        end.edges_to.remove((self, start_port, end_port))
+
+    def label(self, label):
+        assert self._variant == "data"
+        if self._token_text is not None:
+            self._token_text = f"{label}"
+
+    def tag(self, tag, kind):
+        if kind == "image":
+            self._tags.append(vz.Image(tag))
+        elif kind == "text":
+            self._tags.append(vz.Token(str(tag), color=self._token_color))
+        else:
+            raise ValueError(f"Unsupported tag of kind {kind}.")
+
+    def replace_with_edges(self) -> bool:
+        """
+        Checks if this is a data node which only exists to connect to other data nodes at higher container levels. If
+        so, reroute all edges through this node to circumvent it; this node then no longer needs to be added to the
+        graph.
+        """
+        if self._variant != "data" or len(self.edges_to) == 0:
+            return False
+        assert len(self.edges_to) == 1
+        edges = [(edge, edge) for edge in self.edges]
+        connects_to_call_input = False
+        connected_data = []
+        while len(edges) > 0:
+            (start_port, end_node, end_port), first_edge = edges.pop()
+            if end_node._variant == "data":
+                connected_data.append((end_node, first_edge))
+            elif "i" in end_port:
+                connects_to_call_input = True
+                break
+            else:
+                edges.extend([(edge, first_edge) for edge in end_node.edges if edge[0] == end_port])
+        if not connects_to_call_input and len(connected_data) > 0:
+            assert len(self.edges_to) == 1
+            # remove the edge from the preceding node to self
+            creator_node, creator_port, input_port = self.edges_to[0]
+            creator_node.remove_edge(creator_port, self, input_port)
+            assert len(self.edges_to) == 0
+            for end_node, first_edge in connected_data:
+                # create an edge from the preceding node to the end of the self-starting edge
+                creator_node.edge(creator_port, first_edge[1], first_edge[2])
+            return True
+        return False
 
     def has_ancestor(self, ancestor: "ComputationGraphNode"):
         return ancestor in self.ancestors
@@ -77,8 +158,21 @@ class ComputationGraphNode:
 
     def __view__(self):
         # TODO We can't do this on initialization, since it currently causes an infinite loop of tracked functions
-        if isinstance(self._payload, torch.Tensor):
-            self._view.item('values', str(self._payload))
+        # if isinstance(self._payload, torch.Tensor):
+        #     self._view.item('values', str(self._payload))
+        if self._token_text is not None:
+            self._view = vz.Token(self._token_text, color=self._token_color)
+            if len(self._tags) > 0:
+                self._view = vz.Switch(["label"] + [str(i) for i in range(len(self._tags))], {"label": self._view})
+                for i, tag in enumerate(self._tags):
+                    self._view.item(str(i), tag)
+            # if isinstance(self._payload, torch.Tensor):
+                # plt.hist(self._payload.detach().numpy().flatten())
+                # plt.title("Distribution of values")
+                # plt.ylabel("Number of elements")
+                # plt.tight_layout()
+                # pic_hash = plt_to_bytes()
+                # plt.clf()
         return self._view
 
 
@@ -89,7 +183,7 @@ class FunctionContext:
         self.text = self.fn.__name__
 
     def __view__(self):
-        return vz.Token(self.text, color='red')
+        return vz.Token(self.text, color="red")
 
 
 _MAGIC_METHODS = [
@@ -119,6 +213,7 @@ class Tracker:
         self._hooks = []
         self._node: Optional[ComputationGraphNode] = None
         self._old_modules: Dict[str, Dict[str, Any]] = dict()
+        self._paused = False
 
     def start(self) -> None:
         self._node = ComputationGraphNode(None, "data")
@@ -127,6 +222,7 @@ class Tracker:
         for var, value in vars(torch).items():
             if callable(value) and not inspect.isclass(value):
                 setattr(torch, var, self._wrap_fn(value))
+                assert getattr(torch, var).cg_is_wrapped
                 self._old_modules["torch"][var] = value
 
         for var in dir(torch.Tensor):
@@ -134,6 +230,7 @@ class Tracker:
             if callable(value) and var in _MAGIC_METHODS:
                 setattr(torch.Tensor, var, self._wrap_fn(value))
                 self._old_modules["torch.Tensor"][var] = value
+
         for model in self._models:
             for module in model.modules():
                 self._hooks.append(module.register_forward_pre_hook(self._on_call))
@@ -150,32 +247,37 @@ class Tracker:
             hook.remove()
 
         d = vz.Dag()
-        node_to_id = {}
+        node_to_id: Dict[ComputationGraphNode, str] = {}
+        node_to_parent: Dict[ComputationGraphNode, str] = {}
         while len(nodes) > 0:
             node, parent = nodes.pop()
-            node_to_id[node] = str(len(node_to_id))
-            # print(len(node_to_id))
-            d.node(
-                node_to_id[node],
-                parent=parent,
-                item=node,
-                is_expanded=node.is_expanded(),
-                flow_direction="south" if len(node.temporal_groups) == 1 else "east",
-            )
-            if len(node.temporal_groups) > 1:
-                for t in range(len(node.temporal_groups)):
-                    d.node(
-                        f"{node_to_id[node]}_{t}",
-                        parent=node_to_id[node],
-                        is_interactive=False,
-                        flow_direction="south",
-                    )
-                    d.item(None, f"{node_to_id[node]}_{t}")
-                    for child in node.temporal_groups[t]:
-                        nodes.append((child, f"{node_to_id[node]}_{t}"))
-            else:
-                for child in node.temporal_groups[0]:
-                    nodes.append((child, node_to_id[node]))
+            if not node.replace_with_edges():
+                node_to_id[node] = str(len(node_to_id))
+                node_to_parent[node] = parent
+                # print(len(node_to_id))
+                d.node(
+                    node_to_id[node],
+                    parent=parent,
+                    item=node,
+                    is_expanded=node.is_expanded(),
+                    flow_direction="south" if len(node.temporal_groups) == 1 else "east",
+                    label=node._token_text,
+                )
+                if len(node.temporal_groups) > 1:
+                    for t in range(len(node.temporal_groups)):
+                        d.node(
+                            f"{node_to_id[node]}_{t}",
+                            parent=node_to_id[node],
+                            is_interactive=False,
+                            is_visible=False,
+                            flow_direction="south",
+                        )
+                        d.item(None, f"{node_to_id[node]}_{t}")
+                        for child in node.temporal_groups[t]:
+                            nodes.append((child, f"{node_to_id[node]}_{t}"))
+                else:
+                    for child in node.temporal_groups[0]:
+                        nodes.append((child, node_to_id[node]))
         for node in node_to_id:
             for edge in node.edges:
                 start_port, end_node, end_port = edge
@@ -195,8 +297,18 @@ class Tracker:
                     order=int(end_port[1:]),
                     label=end_node.port_names[end_port],
                 )
+                # TODO: HACK HACK HACK
+                temporal = (
+                    node_to_parent[node] != node_to_parent[end_node]
+                    and node_to_parent[node] != node_to_id[end_node]
+                    and node_to_id[node] != node_to_parent[end_node]
+                    and node.parent != end_node
+                    and end_node.parent != node
+                )
                 d.edge(
-                    {"id": node_to_id[node], "port": start_port,}, {"id": node_to_id[end_node], "port": end_port,},
+                    {"id": node_to_id[node], "port": start_port,},
+                    {"id": node_to_id[end_node], "port": end_port,},
+                    temporal=temporal,
                 )
         # TODO: alignments
         # for other in node.alignments:
@@ -210,9 +322,34 @@ class Tracker:
         self._models.append(model)
 
     def tick(self):
-        self._node.create_temporal()
+        if self._node is not None:
+            self._node.create_temporal()
+
+    def label(self, data, label):
+        try:
+            data.cg_label = label
+            data.cg_location[0].label(label)
+        except AttributeError:
+            pass
+
+    def tag(self, data, tag, kind):
+        try:
+            if not hasattr(data, "cg_tags"):
+                data.cg_tags = []
+            data.cg_tags.append((tag, kind))
+            data.cg_location[0].tag(tag, kind)
+        except AttributeError as e:
+            pass
+
+    @contextmanager
+    def pause(self):
+        self._paused = True
+        yield
+        self._paused = False
 
     def _on_call(self, fn: Union[nn.Module, FunctionContext], arguments: Tuple[Any, ...]):
+        if self._paused:
+            return
         call_node = self._node.child(ComputationGraphNode(fn, "call"))
 
         argument_locations: List[List[Tuple[ComputationGraphNode, str]]] = []
@@ -231,7 +368,6 @@ class Tracker:
                         # Test for primitives. If we don't try to set `cg_location` to a dummy value first, the new
                         # data node will be created before `cg_location` is set, causing there to be an extraneous
                         # data node connected to nothing.
-                        # TODO: should we create data nodes for these primitives anyway?
                         arg_value.cg_location = None
                         arg_value.cg_location = (
                             self._node.child(ComputationGraphNode(arg_value, "data")),
@@ -253,6 +389,8 @@ class Tracker:
         self._node = call_node
 
     def _on_return(self, fn: Union[nn.Module, FunctionContext], arguments: Tuple[Any], outputs: Any):
+        if self._paused:
+            return
         for i, arg in enumerate(arguments):
             # We do "iterable cracking" by default, so if the argument isn't an iterable already, make it one
             arg_iterable: Union[List[Any], Tuple[Any]]
@@ -301,19 +439,20 @@ class Tracker:
     # TODO: make it so printing doesnt create hundreds of extra nodes
     # TODO: cleanup graph and node and separate out functions
     # TODO: primitive inputs (i.e., integers into __getitem__)
-    # TODO: don't duplicate data nodes when they get passed through parent interface
     # TODO: deal with in-place ops (maybe done?)
     # TODO: make modules return subclassed primitives (why?)
 
     def _wrap_fn(self, fn):
         def _wrapped(*args, **kwargs):
+            if self._paused:
+                return fn(*args, **kwargs)
             ctx = FunctionContext(fn)
-            print(fn.__name__)
+            # print(fn.__name__)
             if fn.__name__ not in special_functions:
                 inputs = args + tuple(kwargs.values())
             else:
                 inputs, ctx.text = special_functions[fn.__name__](args, kwargs)
-                print(ctx.text)
+                # print(ctx.text)
             self._on_call(ctx, inputs)
             outputs = fn(*args, **kwargs)
             is_output_iterable = isinstance(outputs, (list, tuple))
@@ -325,6 +464,7 @@ class Tracker:
             self._on_return(ctx, inputs, outputs)
             return outputs
 
+        _wrapped.cg_is_wrapped = True
         return _wrapped
 
 
@@ -341,13 +481,40 @@ def start(model):
 def finish():
     global _tracker
     assert _tracker is not None
-    return _tracker.finish()
+    output = _tracker.finish()
+    _tracker = None
+    return output
 
 
 def tick():
     global _tracker
-    assert _tracker is not None
-    _tracker.tick()
+    if _tracker is not None:
+        _tracker.tick()
+
+
+def label(data, label):
+    global _tracker
+    if _tracker is not None:
+        _tracker.label(data, label)
+
+
+def tag(data, tag, kind):
+    global _tracker
+    if _tracker is not None:
+        _tracker.tag(data, tag, kind)
+
+
+def tracking():
+    global _tracker
+    return _tracker is not None
+
+
+@contextmanager
+def pause():
+    global _tracker
+    if _tracker is not None:
+        with _tracker.pause():
+            yield
 
 
 # Whenever a module gets called:
@@ -364,64 +531,48 @@ def tick():
 # OLD 3. for each output, set its location to the module's output port
 # NEW 3. for each output, create a data node and set its location to the data node
 
-
-class Model(nn.Module):
-    def __init__(self):
-        super(Model, self).__init__()
-        self.l1 = nn.Linear(128, 128)
-        self.relu = nn.ReLU()
-        self.s = nn.Sequential(nn.ReLU(), nn.ELU(),)
-        self.l2 = nn.Linear(128, 128)
-
-    def forward(self, x):
-        tick()
-        x = self.l1(x)
-        x = F.relu(x)
-        tick()
-        x = self.l1(x)
-        x = F.relu(x)
-        tick()
-        x = self.l1(x)
-        x = F.relu(x)
-        return x
-
-
-class LSTM(nn.Module):
-    def __init__(self):
-        super(LSTM, self).__init__()
-        self.cell = nn.LSTMCell(64, 128)
-
-    def forward(self, x):
-        outputs = []
-        h, c = None, None
-        for i in range(x.shape[1]):
-            tick()
-            if h is None:
-                h, c = self.cell(x[:, i, :])
-            else:
-                h, c = self.cell(x[:, i, :], (h, c))
-            h /= 2
-            outputs.append(h)
-        return torch.stack(outputs, dim=1)
+# class Model(nn.Module):
+#     def __init__(self):
+#         super(Model, self).__init__()
+#         self.l1 = nn.Linear(128, 128)
+#         self.relu = nn.ReLU()
+#         self.s = nn.Sequential(nn.ReLU(), nn.ELU(),)
+#         self.l2 = nn.Linear(128, 128)
+#
+#     def forward(self, x):
+#         tick()
+#         x = self.l1(x)
+#         x = F.relu(x)
+#         tick()
+#         x = self.l1(x)
+#         x = F.relu(x)
+#         tick()
+#         x = self.l1(x)
+#         x = F.relu(x)
+#         return x
 
 
 def main():
-    # model = Model()
-    # model = tvmodels.squeezenet1_0()
+    # model = SimpleFeedforward()
     model = LSTM()
-    # model = nn.Linear(10, 20)
-    # model = nn.Transformer(d_model=64)
+    # model = tvmodels.resnet18().eval()
+    # model = nn.Transformer(d_model=64, num_encoder_layers=2, num_decoder_layers=2, nhead=2).eval()
     print(model)
     start(model)
-    # model(torch.rand(5, 10))
-    model(torch.rand(1, 3, 64))
-    # model(torch.rand(1, 10, 64), torch.rand(1, 10, 64))
-    # model(torch.rand((1, 3, 224, 224)))
-    # model(torch.rand(1, 128))
+    x = torch.rand(1, 3, 64)
+    x = x - torch.mean(x)
+    # model(torch.rand(1, 64))
+    model(x)
+    # model(torch.rand(1, 3, 16, 16))
+    # model(torch.rand(1, 3, 64), torch.rand(1, 3, 64))
     graph = finish()
-    with connect('http://34.94.109.120:80'):
-        get_logger('main').info(graph)
-    print(str(vz.assemble(graph)).replace("None", "null").replace("False", "false").replace("True", "true"))
+    with connect("http://localhost:4000"):
+        get_logger("main").info(graph)
+
+    # writer = SummaryWriter("tb")
+    # writer.add_graph(model, [torch.rand(1, 3, 64), torch.rand(1, 3, 64)])
+    # writer.close()
+    # print(str(vz.assemble(graph)).replace("None", "null").replace("False", "false").replace("True", "true"))
 
 
 if __name__ == "__main__":

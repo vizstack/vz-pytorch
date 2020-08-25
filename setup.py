@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name='vz-pytorch',
-    version='0.1.0',
+    version='0.1.3',
     license='MIT',
     packages=['vzpytorch'],
     zip_safe=False,

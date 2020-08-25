@@ -9,7 +9,7 @@ import torch.nn as nn
 
 import vizstack as vz
 
-from vz_pytorch.special_functions import FUNCTIONS as special_functions
+from vzpytorch.special_functions import FUNCTIONS as special_functions
 
 __all__ = ["start", "stop", "tracking", "tick", "name", "tag", "tag_image", "pause"]
 

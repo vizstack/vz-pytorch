@@ -522,3 +522,5 @@ def pause():
     if _tracker is not None:
         with _tracker.pause():
             yield
+    else:
+        yield

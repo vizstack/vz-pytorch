@@ -7,7 +7,7 @@ setup(
     name='vz-pytorch',
     version='0.1.0',
     license='MIT',
-    packages=['vz_pytorch'],
+    packages=['vzpytorch'],
     zip_safe=False,
     author='Ryan Holmdahl & Nikhil Bhattasali',
     author_email='vizstack@gmail.com',
